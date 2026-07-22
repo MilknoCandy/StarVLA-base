@@ -793,8 +793,51 @@ run_scheduler() {
     done
 }
 
+setup_environment() {
+    # ============================================================
+    # Project paths
+    # ============================================================
+
+    export STARVLA_DIR="/path/to/StarVLA"
+    export LIBERO_HOME="/path/to/LIBERO"
+
+    # ============================================================
+    # Python environments
+    # ============================================================
+
+    export ABot_python="/path/to/starvla_env/bin/python"
+    export LIBERO_PYTHON="/path/to/libero_env/bin/python"
+
+    # ============================================================
+    # Rendering
+    # ============================================================
+
+    export MUJOCO_GL="osmesa"
+
+    # ============================================================
+    # Model server
+    # ============================================================
+
+    export USE_BF16=1
+
+    # ============================================================
+    # HuggingFace / W&B
+    # ============================================================
+
+    export HF_ENDPOINT="https://hf-mirror.com"
+    export WANDB_MODE="disabled"
+
+    # ============================================================
+    # Optional
+    # ============================================================
+
+    export TOKENIZERS_PARALLELISM="false"
+}
+
 main() {
     parse_args "$@"
+
+    setup_environment
 
     if [[ -z "${CKPT_PATH}" ]]; then
         echo "[ERROR] --ckpt is required." >&2
