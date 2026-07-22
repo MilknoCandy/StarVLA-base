@@ -20,6 +20,7 @@ from libero.libero.envs import OffScreenRenderEnv
 
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.tools import read_mode_config
+from deployment.model_server.tools.websocket_policy_client import WebsocketClientPolicy
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import torch
@@ -150,13 +151,10 @@ class PolicyModel:
         # build client to connect server policy
         self.policy_setup = policy_setup
         self.unnorm_key = unnorm_key
-        vla = baseframework.from_pretrained(  # TODO should auto detect framework from model path
-            policy_ckpt_path,
-        )
-
-        if use_bf16:  # False
-            vla = vla.to(torch.bfloat16)
-        self.vla = vla.to("cuda").eval()
+        self.client = WebsocketClientPolicy(host, port)
+        meta = self.client.get_server_metadata()
+        self.action_chunk_size = int(meta["action_chunk_size"])
+        self._server_metadata = meta
 
         print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key} ***")
         self.use_ddim = use_ddim
@@ -180,7 +178,7 @@ class PolicyModel:
         self.num_image_history = 0
 
         self.action_norm_stats = self.get_action_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path)
-        self.action_chunk_size = self.get_action_chunk_size(policy_ckpt_path=policy_ckpt_path)
+        # self.action_chunk_size = self.get_action_chunk_size(policy_ckpt_path=policy_ckpt_path)
 
     def _add_image_to_history(self, image: np.ndarray) -> None:
         self.image_history.append(image)
@@ -224,7 +222,7 @@ class PolicyModel:
 
         action_chunk_size = self.action_chunk_size
         if step % action_chunk_size == 0:
-            response = self.vla.predict_action(example, **vla_input)
+            response = self.client.predict_action(example, **vla_input)
             normalized_actions = response["normalized_actions"]  # B, chunk, D
 
             normalized_actions = normalized_actions[0]
