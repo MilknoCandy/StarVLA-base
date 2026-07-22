@@ -2,26 +2,18 @@
 set -Eeuo pipefail
 
 # ============================================================================
-# 执行一个 LIBERO-plus 切片
+# 为一个 GPU slot 启动长期运行的 Policy Server
 #
 # 主脚本调用形式：
 #
 # CUDA_VISIBLE_DEVICES=<physical_gpu> \
-# LIBERO_PRETRAINED_PATH=<checkpoint> \
-# bash eval_libero_in_one.sh \
-#     <task_suite_name> \
-#     <start_idx> \
-#     <end_idx> \
-#     <server_host> \
-#     <server_port> \
-#     <result_dir>
+# bash run_policy_server.sh \
+#     <checkpoint_path> \
+#     <host> \
+#     <port>
 #
-# 本脚本：
-#
-# 1. 不启动 Policy Server；
-# 2. 不再次切分 start/end；
-# 3. 不在内部启动多个后台 evaluator；
-# 4. 只连接主调度器为当前 GPU 启动的长期 Server。
+# CUDA_VISIBLE_DEVICES 设置后，Python 进程内部只能看到一张 GPU，
+# 因此服务端代码继续使用 cuda:0 即可。
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,10 +22,8 @@ find_starvla_root() {
     local current="${SCRIPT_DIR}"
 
     while [[ "${current}" != "/" ]]; do
-        if [[ -f "${
-                current
-            }/examples/simBenchmarks/LIBERO-plus/eval_files/parallel_eval/eval_libero_model.py" ]] &&
-           [[ -d "${current}/deployment/model_server" ]]; then
+        if [[ -f "${current}/deployment/model_server/server_policy.py" ]] &&
+           [[ -d "${current}/examples/simBenchmarks/LIBERO-plus" ]]; then
 
             printf '%s\n' "${current}"
             return 0
@@ -45,6 +35,7 @@ find_starvla_root() {
     return 1
 }
 
+# 优先使用显式设置的 STARVLA_DIR。
 if [[ -n "${STARVLA_DIR:-}" ]]; then
     STARVLA_DIR="$(cd "${STARVLA_DIR}" && pwd)"
 
@@ -56,168 +47,111 @@ else
     fi
 fi
 
-LIBERO_HOME="${LIBERO_HOME:-}"
-LIBERO_PYTHON="${LIBERO_PYTHON:-python}"
+# 兼容你原来的 ABot_python 环境变量。
+ABOT_PYTHON="${ABot_python:-${ABOT_PYTHON:-python}}"
 
-# 保留你原来的默认渲染方式。
-MUJOCO_GL="${MUJOCO_GL:-osmesa}"
+# 主接口使用位置参数，同时兼容原来的环境变量。
+CKPT_PATH="${1:-${your_ckpt:-}}"
+HOST="${2:-${server_host:-127.0.0.1}}"
+PORT="${3:-${base_port:-9883}}"
 
-TASK_SUITE_NAME="${1:?Missing task_suite_name}"
-START_IDX="${2:?Missing start_idx}"
-END_IDX="${3:?Missing end_idx}"
+USE_BF16="${USE_BF16:-1}"
 
-SERVER_HOST="${4:-127.0.0.1}"
-SERVER_PORT="${5:?Missing server_port}"
-
-OUTPUT_DIR="${
-    6:-
-    ${output_dir:-${STARVLA_DIR}/results/libero_plus_parallel_eval}
+SERVER_ENTRY="${
+    POLICY_SERVER_ENTRY:-
+    deployment/model_server/server_policy.py
 }"
 
-# 主调度器通过 LIBERO_PRETRAINED_PATH 传入。
+# 你的原始 server_policy.py 没有传入 host。
 #
-# 同时兼容你原来的 your_ckpt 环境变量。
-PRETRAINED_PATH="${
-    LIBERO_PRETRAINED_PATH:-
-    ${your_ckpt:-}
-}"
-
-NUM_TRIALS_PER_TASK="${NUM_TRIALS_PER_TASK:-1}"
-
-EVAL_ENTRY="${
-    LIBERO_EVAL_ENTRY:-
-    examples/simBenchmarks/LIBERO-plus/eval_files/parallel_eval/eval_libero_model.py
-}"
-
-# eval_libero_model.py 中连接 Model Server 的参数名。
+# 服务端支持 host 参数时，可设置：
 #
-# 默认假设为：
+# export POLICY_SERVER_HOST_FLAG=--host
 #
-# --host
-# --port
+# 默认保持为空，不向 Python 传 host。
+POLICY_SERVER_HOST_FLAG="${POLICY_SERVER_HOST_FLAG:-}"
+
+# 其他额外参数，例如：
 #
-# 实际参数不同时，可以通过环境变量修改。
-EVAL_HOST_FLAG="${LIBERO_EVAL_HOST_FLAG:---host}"
-EVAL_PORT_FLAG="${LIBERO_EVAL_PORT_FLAG:---port}"
+# export POLICY_SERVER_EXTRA_ARGS='--action_horizon 8'
+POLICY_SERVER_EXTRA_ARGS="${POLICY_SERVER_EXTRA_ARGS:-}"
 
-LIBERO_EVAL_EXTRA_ARGS="${LIBERO_EVAL_EXTRA_ARGS:-}"
-
-if [[ -z "${LIBERO_HOME}" ]]; then
-    echo "[ERROR] LIBERO_HOME is required." >&2
-    exit 1
-fi
-
-if [[ -z "${PRETRAINED_PATH}" ]]; then
-    echo "[ERROR] LIBERO_PRETRAINED_PATH is required." >&2
-    exit 1
-fi
-
-if [[ ! -e "${PRETRAINED_PATH}" ]]; then
+if [[ -z "${CKPT_PATH}" ]]; then
+    echo "[ERROR] Missing checkpoint path." >&2
     echo \
-        "[ERROR] Pretrained path does not exist:" \
-        "${PRETRAINED_PATH}" >&2
-
+        "Usage: bash run_policy_server.sh" \
+        "<checkpoint_path> <host> <port>" >&2
     exit 1
 fi
 
-if [[ ! -f "${STARVLA_DIR}/${EVAL_ENTRY}" ]]; then
-    echo "[ERROR] Evaluation entry does not exist:" >&2
-    echo "        ${STARVLA_DIR}/${EVAL_ENTRY}" >&2
+if [[ ! -e "${CKPT_PATH}" ]]; then
+    echo "[ERROR] Checkpoint does not exist: ${CKPT_PATH}" >&2
     exit 1
 fi
 
-if ! [[ "${START_IDX}" =~ ^[0-9]+$ ]] ||
-   ! [[ "${END_IDX}" =~ ^[0-9]+$ ]] ||
-   (( START_IDX >= END_IDX )); then
-
-    echo \
-        "[ERROR] Invalid interval:" \
-        "[${START_IDX}, ${END_IDX})" >&2
-
+if [[ ! -f "${STARVLA_DIR}/${SERVER_ENTRY}" ]]; then
+    echo "[ERROR] Policy server entry does not exist:" >&2
+    echo "        ${STARVLA_DIR}/${SERVER_ENTRY}" >&2
     exit 1
 fi
 
-if ! command -v "${LIBERO_PYTHON}" >/dev/null 2>&1 &&
-   [[ ! -x "${LIBERO_PYTHON}" ]]; then
+if ! command -v "${ABOT_PYTHON}" >/dev/null 2>&1 &&
+   [[ ! -x "${ABOT_PYTHON}" ]]; then
 
-    echo \
-        "[ERROR] Python executable not found:" \
-        "${LIBERO_PYTHON}" >&2
-
+    echo "[ERROR] Python executable not found: ${ABOT_PYTHON}" >&2
     exit 1
 fi
 
-mkdir -p "${OUTPUT_DIR}"
+# 单独执行本脚本时，仍兼容原来的 gpu_id。
+#
+# 由主调度器调用时，CUDA_VISIBLE_DEVICES 已经设置。
+if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    export CUDA_VISIBLE_DEVICES="${gpu_id:-0}"
+fi
 
 cd "${STARVLA_DIR}"
 
-export MUJOCO_GL
-export LIBERO_CONFIG_PATH="${LIBERO_HOME}/libero"
-
 export PYTHONPATH="${
-    LIBERO_HOME
-}:${STARVLA_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
-
-# 同时通过环境变量暴露 Server 地址。
-#
-# 当 eval_libero_model.py 不使用 CLI 参数，而是读取环境变量时，
-# 可以直接读取这两个变量。
-export LIBERO_SERVER_HOST="${SERVER_HOST}"
-export LIBERO_SERVER_PORT="${SERVER_PORT}"
+    STARVLA_DIR
+}${PYTHONPATH:+:${PYTHONPATH}}"
 
 CMD=(
-    "${LIBERO_PYTHON}"
-    "${EVAL_ENTRY}"
+    "${ABOT_PYTHON}"
+    "${SERVER_ENTRY}"
 
-    --pretrained_path
-    "${PRETRAINED_PATH}"
+    --ckpt_path
+    "${CKPT_PATH}"
 
-    --task_suite_name
-    "${TASK_SUITE_NAME}"
-
-    --num_trials_per_task
-    "${NUM_TRIALS_PER_TASK}"
-
-    --output_dir
-    "${OUTPUT_DIR}"
-
-    --start_idx
-    "${START_IDX}"
-
-    --end_idx
-    "${END_IDX}"
+    --port
+    "${PORT}"
 )
 
-if [[ -n "${EVAL_HOST_FLAG}" ]]; then
+# 只有服务端代码确实支持 host 时才添加。
+if [[ -n "${POLICY_SERVER_HOST_FLAG}" ]]; then
     CMD+=(
-        "${EVAL_HOST_FLAG}"
-        "${SERVER_HOST}"
+        "${POLICY_SERVER_HOST_FLAG}"
+        "${HOST}"
     )
 fi
 
-if [[ -n "${EVAL_PORT_FLAG}" ]]; then
-    CMD+=(
-        "${EVAL_PORT_FLAG}"
-        "${SERVER_PORT}"
-    )
+if [[ "${USE_BF16}" == "1" ]]; then
+    CMD+=(--use_bf16)
 fi
 
-if [[ -n "${LIBERO_EVAL_EXTRA_ARGS}" ]]; then
-    read -r -a EXTRA_ARGS <<< "${LIBERO_EVAL_EXTRA_ARGS}"
+if [[ -n "${POLICY_SERVER_EXTRA_ARGS}" ]]; then
+    read -r -a EXTRA_ARGS <<< "${POLICY_SERVER_EXTRA_ARGS}"
     CMD+=("${EXTRA_ARGS[@]}")
 fi
 
 echo "============================================================"
-echo "[LIBERO EVALUATOR]"
+echo "[POLICY SERVER]"
 echo "repo                 : ${STARVLA_DIR}"
-echo "python               : ${LIBERO_PYTHON}"
-echo "CUDA_VISIBLE_DEVICES : ${CUDA_VISIBLE_DEVICES:-unset}"
-echo "MUJOCO_GL            : ${MUJOCO_GL}"
-echo "task suite           : ${TASK_SUITE_NAME}"
-echo "range                : [${START_IDX}, ${END_IDX})"
-echo "server               : ${SERVER_HOST}:${SERVER_PORT}"
-echo "checkpoint           : ${PRETRAINED_PATH}"
-echo "output               : ${OUTPUT_DIR}"
+echo "python               : ${ABOT_PYTHON}"
+echo "CUDA_VISIBLE_DEVICES : ${CUDA_VISIBLE_DEVICES}"
+echo "checkpoint           : ${CKPT_PATH}"
+echo "host                 : ${HOST}"
+echo "port                 : ${PORT}"
+echo "bf16                 : ${USE_BF16}"
 
 printf 'command              :'
 printf ' %q' "${CMD[@]}"
@@ -225,7 +159,8 @@ printf '\n'
 
 echo "============================================================"
 
-# 一个 slot 只执行一个 evaluator。
+# 使用 exec 后，当前 Bash 进程会被 Python Server 替换。
 #
-# exec 保证主调度器记录的 PID 就是实际 Python evaluator PID。
+# 主调度器记录到的 PID 就是实际 Server PID，
+# 便于监控和清理。
 exec "${CMD[@]}"
